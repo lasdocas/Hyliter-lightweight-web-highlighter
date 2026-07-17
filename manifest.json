@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Hyliter",
+  "version": "1.0",
+  "description": "选中网页文本，一键高亮标注；支持深色/浅色两套配色；不做任何持久化保存",
+  "icons": {
+    "16": "ico16.png",
+    "48": "ico48.png",
+    "128": "ico128.png"
+  },
+  "action": {
+    "default_icon": {
+      "16": "ico16.png",
+      "48": "ico48.png",
+      "128": "ico128.png"
+    }
+  },
+  "permissions": ["storage"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

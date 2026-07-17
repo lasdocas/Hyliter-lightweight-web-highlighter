@@ -1,0 +1,219 @@
+/* ============ 选区操作面板 ============ */
+.twh-panel {
+  position: fixed;
+  z-index: 2147483647;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 14px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.18);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  -webkit-user-select: none;
+  user-select: none;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  border: 1px solid transparent;
+  box-sizing: border-box;
+}
+
+.twh-panel.twh-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.twh-panel.twh-theme-light {
+  background: #3a3a3d;
+  border-color: #2e2e30;
+}
+
+.twh-panel.twh-theme-dark {
+  background: #e9e9ec;
+  border-color: #d6d6d9;
+}
+
+/* 指向选区的小箭头：面板在选区下方时贴顶部朝上，在上方时贴底部朝下 */
+.twh-arrow {
+  position: absolute;
+  width: 0;
+  height: 0;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  pointer-events: none;
+}
+.twh-arrow-up {
+  top: -6px;
+}
+.twh-arrow-down {
+  bottom: -6px;
+}
+.twh-theme-light .twh-arrow-up {
+  border-bottom: 6px solid #3a3a3d;
+}
+.twh-theme-light .twh-arrow-down {
+  border-top: 6px solid #3a3a3d;
+}
+.twh-theme-dark .twh-arrow-up {
+  border-bottom: 6px solid #e9e9ec;
+}
+.twh-theme-dark .twh-arrow-down {
+  border-top: 6px solid #e9e9ec;
+}
+
+.twh-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 色块行：7 个色块 + 双色分割 + 复制/清除按钮，都在同一行；
+   允许在极窄场景下换行，避免溢出屏幕 */
+.twh-row-swatches {
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+/* 复制 + 清除按钮组：跟在色块之后，作为整体一起换行，
+   用左边框充当二者与色块之间的竖线分隔符 */
+.twh-actions-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  margin-left: 4px;
+  padding-left: 8px;
+  border-left: 1px solid transparent;
+}
+.twh-theme-light .twh-actions-group {
+  border-left-color: rgba(255, 255, 255, 0.18);
+}
+.twh-theme-dark .twh-actions-group {
+  border-left-color: rgba(0, 0, 0, 0.12);
+}
+
+/* 第一行：图标按钮 */
+.twh-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+}
+
+.twh-theme-light .twh-btn {
+  color: #f2f2f2;
+}
+.twh-theme-dark .twh-btn {
+  color: #2b2b2e;
+}
+.twh-theme-light .twh-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+.twh-theme-dark .twh-btn:hover {
+  background: rgba(0, 0, 0, 0.08);
+}
+
+/* “清除”按钮：第一次点击后进入待确认状态，等待第二次点击。
+   呼吸灯动效改由 JS 里的 Element.animate()（Web Animations API）直接驱动，
+   不再靠这里的 animation + @keyframes ——
+   原因见 content.js 中 pulseConfirm() 上方的注释：宿主页面若用了 CSS Cascade
+   Layers（@layer），我们这份未分层样式表里的 !important 在 important 层级战中
+   会稳输给页面自己放在具名层里的 !important，与选择器优先级无关，CSS 端无法可靠修复。 */
+.twh-btn-confirm {
+  background: #e5484d !important;
+  color: #fff !important;
+}
+
+/* “复制”按钮点击后的一次性反馈：底色短暂变为绿色（与“清除”按钮确认态的红色 #e5484d
+   同属一套配色体系里对应的绿色 #30a46c，深浅/饱和度相近，视觉上是一对）；
+   弹一下的动效同样改由 JS(WAAPI) 驱动，理由同上 */
+.twh-btn-copied {
+  background: #30a46c !important;
+  color: #fff !important;
+}
+
+/* 颜色圆点：浅/深两色对角分割 */
+.twh-swatch {
+  box-sizing: border-box;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  cursor: pointer;
+  padding: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  box-shadow: none;
+  transition: transform 0.1s ease;
+}
+.twh-swatch:hover {
+  transform: scale(1.18);
+}
+
+/* 浅色面板现在是深灰底，浅色色块要用浅色描边才能和底色分开 */
+.twh-theme-light .twh-swatch {
+  border: 1.5px solid rgba(255, 255, 255, 0.5);
+}
+.twh-theme-light .twh-swatch:hover {
+  border-color: rgba(255, 255, 255, 0.85);
+}
+
+/* 深色面板现在是浅灰底，深色色块要用深色描边才能和底色分开 */
+.twh-theme-dark .twh-swatch {
+  border: 1.5px solid rgba(0, 0, 0, 0.28);
+}
+.twh-theme-dark .twh-swatch:hover {
+  border-color: rgba(0, 0, 0, 0.48);
+}
+
+/* ============ 高亮标记本身 ============ */
+.twh-highlight-mark {
+  border-radius: 2px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  cursor: pointer;
+}
+
+/* 悬浮在已高亮文本上方的取消高亮按钮 */
+.twh-unmark-btn {
+  position: fixed;
+  z-index: 2147483647;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  -webkit-user-select: none;
+  user-select: none;
+  transition: transform 0.1s ease, background 0.1s ease;
+}
+.twh-unmark-btn:hover {
+  transform: scale(1.1);
+}
+
+.twh-unmark-btn.twh-theme-light {
+  background: #3a3a3d;
+  color: #f2f2f2;
+}
+.twh-unmark-btn.twh-theme-light:hover {
+  background: #333336;
+}
+
+.twh-unmark-btn.twh-theme-dark {
+  background: #e9e9ec;
+  color: #2b2b2e;
+}
+.twh-unmark-btn.twh-theme-dark:hover {
+  background: #f2f2f4;
+}
