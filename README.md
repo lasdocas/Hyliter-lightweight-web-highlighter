@@ -24,8 +24,12 @@
 - 🎯 **防误触与精准撤销**：鼠标悬浮即可单条精准撤销；“清除全部”按钮采用 2.5 秒跳动二次确认设计，告别手滑烦恼。
 
 ### 🌐 兼容性
-本插件基于 Chrome Extension Manifest V3 标准开发，完美兼容所有 Chromium 内核浏览器：
+本插件基于 Chrome Extension Manifest V3 标准开发，适用于 Chromium 内核浏览器：
 - 🌐 **Google Chrome** | 🔷 **Microsoft Edge** | 🦁 **Brave Browser** | 🔴 **Opera / Vivaldi** 等
+
+支持 **open / closed Shadow DOM**、嵌套组件与 slot 内文本的高亮。现代 Chromium 支持跨多个 ShadowRoot 划词，并将同一次操作作为一组撤销、悬浮取消或清除；各片段会按所在位置的背景明暗配色。closed root 的访问依赖 Chromium 扩展提供的能力。旧浏览器缺少跨树选区能力时，仅处理能准确定位的单个 root 内选区，跳过无法准确定位的跨 root 选区。
+
+选色面板与悬浮取消按钮使用浏览器 Top Layer 显示，支持在 Shadow DOM 的 Popover 弹窗和模态对话框内操作。弹窗关闭时，相关插件浮层会一起清理。
 
 ### 🛠️ 安装方法
 
@@ -56,8 +60,12 @@
 - 🎯 **Smart Undo & Clear**: Hover over any highlight to remove it individually. The "Clear All" button features a 2.5-second pulsing confirmation state to prevent accidental clicks.
 
 ### 🌐 Compatibility
-Built strictly on the Chrome Extension Manifest V3 standard, guaranteeing 100% compatibility with all Chromium-based browsers:
+Built on Chrome Extension Manifest V3 for Chromium-based browsers:
 - 🌐 **Google Chrome** | 🔷 **Microsoft Edge** | 🦁 **Brave Browser** | 🔴 **Opera / Vivaldi**
+
+Supports text in **open and closed Shadow DOM**, nested components, and slots. Modern Chromium supports selections across multiple ShadowRoots, with each operation removed or undone as one group and each fragment colored for its local background. Closed roots require Chromium's extension API. Older browsers without composed selection support handle accurately resolved selections within one root and skip ambiguous selections across roots.
+
+The color panel and hover removal button use the browser's Top Layer to remain accessible inside Shadow DOM popovers and modal dialogs. Their floating controls are removed when the containing popup closes.
 
 ### 🛠️ Installation
 
@@ -88,8 +96,12 @@ Built strictly on the Chrome Extension Manifest V3 standard, guaranteeing 100% c
 - 🎯 **Deshacer Inteligente**: Pasa el cursor sobre un resaltado para borrar solo ese. El botón de "Borrar Todo" cuenta con una confirmación visual de 2,5 segundos para evitar borrados accidentales.
 
 ### 🌐 Compatibilidad
-Desarrollada bajo el estándar Chrome Extension Manifest V3, es totalmente compatible con navegadores Chromium:
+Desarrollada bajo el estándar Chrome Extension Manifest V3 para navegadores Chromium:
 - 🌐 **Google Chrome** | 🔷 **Microsoft Edge** | 🦁 **Brave Browser** | 🔴 **Opera / Vivaldi**
+
+Admite texto en **Shadow DOM abierto y cerrado**, componentes anidados y slots. Chromium moderno permite seleccionar texto entre varios ShadowRoots y deshacer o eliminar cada operación como un solo grupo, adaptando los colores al fondo de cada fragmento. El acceso a raíces cerradas requiere la API de extensiones de Chromium. Los navegadores antiguos sin selecciones compuestas solo procesan selecciones que pueden localizar con precisión dentro de una raíz y omiten las selecciones ambiguas entre raíces.
+
+El panel de colores y el botón de eliminación usan la capa superior del navegador (Top Layer) para funcionar dentro de popovers y diálogos modales en Shadow DOM. Sus controles flotantes se eliminan al cerrar la ventana que los contiene.
 
 ### 🛠️ Instalación
 

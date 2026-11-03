@@ -28,7 +28,209 @@
 
   let mode = 'light';     // 当前配色模式：每次弹出面板时，根据选区所在位置的背景色自动判断浅/深，不再支持手动切换
   let panelEl = null;
-  let savedRange = null;  // 弹出面板那一刻的选区，供后续按钮点击时使用
+  let savedSelection = null; // 选区快照：跨 root 的选区拆成各文本节点内的 Range
+  let panelRequest = 0;
+  let unmarkRequest = 0;
+  let floatingStyleSheet = null;
+  const floatingLifetimes = new WeakMap();
+
+  /* ============ Shadow DOM / composed tree ============ */
+
+  const knownRoots = new Set();
+  const boundRoots = new WeakSet();
+  const handledEvents = new WeakSet();
+  const assignedSlots = new WeakMap();
+  // 保留每组高亮的实际节点和所属 root，宿主移除/移动后仍能撤销整组。
+  const highlightGroups = new Map();
+
+  function shadowRootOf(host) {
+    if (host.shadowRoot) return host.shadowRoot;
+    try {
+      return chrome.dom && chrome.dom.openOrClosedShadowRoot(host);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function discoverRoots() {
+    knownRoots.clear();
+    const visit = (root) => {
+      if (knownRoots.has(root)) return;
+      knownRoots.add(root);
+      bindRootEvents(root);
+      root.querySelectorAll('*').forEach((el) => {
+        if (el.localName === 'slot' && typeof el.assignedNodes === 'function') {
+          el.assignedNodes().forEach((node) => assignedSlots.set(node, el));
+        }
+        const shadow = shadowRootOf(el);
+        if (shadow) visit(shadow);
+      });
+    };
+    visit(document);
+    return [...knownRoots];
+  }
+
+  function queryAllRoots(selector) {
+    return discoverRoots().flatMap((root) => [...root.querySelectorAll(selector)]);
+  }
+
+  function assignedSlotOf(node) {
+    if (node.assignedSlot) return node.assignedSlot;
+    const slot = assignedSlots.get(node);
+    // 保留脱离页面的 closed slot 映射，同时拒绝页面重新分配后失效的映射。
+    return slot && slot.assignedNodes().includes(node) ? slot : null;
+  }
+
+  function composedParent(node) {
+    // closed root 内的 slot 不会经 assignedSlot 暴露，使用发现 root 时建立的映射。
+    return assignedSlotOf(node) || node.parentElement ||
+      (node.parentNode && node.parentNode.host) || node.host || null;
+  }
+
+  function manualSlotFor(node) {
+    const slot = assignedSlotOf(node);
+    return slot && slot.getRootNode().slotAssignment === 'manual' ? slot : null;
+  }
+
+  function eventPath(e) {
+    return typeof e.composedPath === 'function' ? e.composedPath() : [e.target];
+  }
+
+  function eventIncludes(e, el) {
+    return !!el && eventPath(e).some((node) => node === el ||
+      (node instanceof Node && el.contains(node)));
+  }
+
+  function isMarkableText(node) {
+    if (!node.nodeValue) return false;
+    for (let el = composedParent(node); el; el = composedParent(el)) {
+      if (el.nodeType === Node.ELEMENT_NODE &&
+          el.matches('.twh-panel, .twh-unmark-btn, script, style, textarea, input')) return false;
+    }
+    return true;
+  }
+
+  // Range 不能跨树。按实际显示的 composed tree（含 slot）给文本和边界编号，
+  // 再把浏览器返回的 StaticRange 拆成各 root 内可修改的普通 Range。
+  function splitComposedRanges(staticRanges) {
+    const bounds = new WeakMap();
+    const visited = new WeakSet();
+    const texts = [];
+    let position = 0;
+    function visit(node) {
+      if (visited.has(node)) return;
+      visited.add(node);
+      const start = position;
+      if (node.nodeType === Node.TEXT_NODE) {
+        position += node.length;
+        texts.push(node);
+      } else {
+        const shadow = node.nodeType === Node.ELEMENT_NODE && shadowRootOf(node);
+        if (shadow) {
+          visit(shadow);
+        } else {
+          const assigned = node.nodeType === Node.ELEMENT_NODE && node.localName === 'slot' &&
+            typeof node.assignedNodes === 'function' ? node.assignedNodes() : [];
+          [...(assigned.length ? assigned : node.childNodes)].forEach(visit);
+        }
+      }
+      bounds.set(node, { start, end: position });
+    }
+    visit(document);
+
+    function boundary(node, offset) {
+      const box = bounds.get(node);
+      if (!box) return null;
+      if (node.nodeType === Node.TEXT_NODE) return box.start + offset;
+      if (offset === 0) return box.start;
+      if (offset === node.childNodes.length) return box.end;
+      for (let i = offset; i < node.childNodes.length; i++) {
+        const next = bounds.get(node.childNodes[i]);
+        if (next) return next.start;
+      }
+      for (let i = offset - 1; i >= 0; i--) {
+        const previous = bounds.get(node.childNodes[i]);
+        if (previous) return previous.end;
+      }
+      return null;
+    }
+
+    const intervals = staticRanges.map((range) => {
+      const start = boundary(range.startContainer, range.startOffset);
+      const end = boundary(range.endContainer, range.endOffset);
+      return start === null || end === null ? null :
+        { start: Math.min(start, end), end: Math.max(start, end) };
+    }).filter(Boolean);
+    const ranges = [];
+    texts.forEach((node) => {
+      if (!isMarkableText(node)) return;
+      const box = bounds.get(node);
+      const parts = intervals.map((interval) => ({
+        start: Math.max(0, interval.start - box.start),
+        end: Math.min(node.length, interval.end - box.start),
+      })).filter((part) => part.start < part.end).sort((a, b) => a.start - b.start);
+      // 合并重叠部分，避免重复包裹同一个文本片段。
+      const merged = [];
+      parts.forEach((part) => {
+        const last = merged[merged.length - 1];
+        if (last && part.start <= last.end) last.end = Math.max(last.end, part.end);
+        else merged.push(part);
+      });
+      merged.forEach((part) => {
+        const range = document.createRange();
+        range.setStart(node, part.start);
+        range.setEnd(node, part.end);
+        ranges.push(range);
+      });
+    });
+    return ranges;
+  }
+
+  function captureSelection() {
+    const roots = discoverRoots();
+    const selection = window.getSelection();
+    // Chromium 的跨树选区可能 isCollapsed === true，必须以 composed ranges 为准。
+    if (!selection) return null;
+    let ranges;
+    if (typeof selection.getComposedRanges === 'function') {
+      const composedRanges = selection.getComposedRanges({
+        shadowRoots: roots.filter((root) => root !== document),
+      }).filter((range) => range.startContainer !== range.endContainer || range.startOffset !== range.endOffset);
+      if (!composedRanges.length) return null;
+      ranges = splitComposedRanges(composedRanges);
+    } else {
+      // 旧浏览器只接受边界确实位于同一个 root 内的选区，拒绝宿主重映射的范围。
+      if (selection.isCollapsed || !selection.anchorNode || !selection.focusNode ||
+          selection.anchorNode.getRootNode() !== selection.focusNode.getRootNode()) return null;
+      const localRanges = [];
+      roots.forEach((root) => {
+        const sel = root === document ? selection :
+          (typeof root.getSelection === 'function' ? root.getSelection() : null);
+        if (!sel || sel.isCollapsed || !sel.anchorNode || !sel.focusNode ||
+            sel.anchorNode.getRootNode() !== root || sel.focusNode.getRootNode() !== root) return;
+        for (let i = 0; i < sel.rangeCount; i++) {
+          const range = sel.getRangeAt(i);
+          if (range.startContainer.getRootNode() === root && range.endContainer.getRootNode() === root) {
+            localRanges.push(range);
+          }
+        }
+      });
+      if (!localRanges.length ||
+          new Set(localRanges.map((range) => range.startContainer.getRootNode())).size > 1) return null;
+      ranges = splitComposedRanges(localRanges);
+    }
+    if (!ranges.length) return null;
+    const spansRoots = new Set(ranges.map((range) => range.startContainer.getRootNode())).size > 1;
+    return { ranges, text: (!spansRoots && selection.toString()) ||
+      ranges.map((range) => range.toString()).join('') };
+  }
+
+  function clearSelection() {
+    window.getSelection()?.removeAllRanges();
+    knownRoots.forEach((root) => {
+      if (root !== document && typeof root.getSelection === 'function') root.getSelection()?.removeAllRanges();
+    });
+  }
 
   let enabled = true; // 插件开启/暂停状态，来自工具栏图标点击，跨标签页同步
   const ENABLED_KEY = 'hyliterEnabled';
@@ -90,13 +292,19 @@
   // 从选区所在节点开始向上找第一个不透明的背景色；
   // 这样即便页面整体是浅色但选区正好落在深色卡片/代码块里，也能就近判断，而不是只看整站背景
   function findBackgroundColor(node) {
-    let el = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+    let el = node.nodeType === Node.ELEMENT_NODE ? node : composedParent(node);
     while (el && el.nodeType === Node.ELEMENT_NODE) {
       const rgb = parseRgb(getComputedStyle(el).backgroundColor);
       if (rgb && rgb.a > 0) return rgb;
-      el = el.parentElement;
+      el = composedParent(el);
     }
-    // 一路向上都是透明背景时，退回浏览器默认画布颜色（白色）
+    // 透明背景时使用宿主继承的 color-scheme；normal 则采用浏览器默认白色画布。
+    const origin = node.nodeType === Node.ELEMENT_NODE ? node : composedParent(node);
+    const scheme = origin && getComputedStyle(origin).colorScheme;
+    if (scheme && scheme.split(/\s+/).includes('dark') &&
+        (!scheme.split(/\s+/).includes('light') || matchMedia('(prefers-color-scheme: dark)').matches)) {
+      return { r: 18, g: 18, b: 18, a: 1 };
+    }
     return { r: 255, g: 255, b: 255, a: 1 };
   }
 
@@ -107,34 +315,99 @@
 
   /* ============ 面板显示 / 隐藏 ============ */
 
-  function showPanelForSelection() {
-    if (!enabled) return;
-    const sel = window.getSelection();
-    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
-    const text = sel.toString();
-    if (!text || !text.trim()) return;
+  function isOpenFloatingOwner(node) {
+    return node.nodeType === Node.ELEMENT_NODE &&
+      ((typeof node.showPopover === 'function' && node.hasAttribute('popover') && node.matches(':popover-open')) ||
+        node.matches('dialog[open]'));
+  }
 
-    savedRange = sel.getRangeAt(0).cloneRange();
-    mode = detectModeForRange(savedRange);
+  async function prepareFloatingLayer(source) {
+    const ancestors = [];
+    for (let node = source; node; node = composedParent(node)) {
+      if (isOpenFloatingOwner(node)) ancestors.push(node);
+    }
+    // 留在宿主弹窗内部：点击面板不应被 auto popover 当成点击外部，
+    // modal dialog 的 inert 规则也要求交互元素属于该 dialog 的子树。
+    const owner = ancestors[0];
+    const container = owner ? (shadowRootOf(owner) || owner) : document.body;
+    const root = container.getRootNode();
+    if (root !== document) {
+      // document 中的 content.css 无法穿透 closed ShadowRoot。复用扩展自己的
+      // 样式表，并通过 adoptedStyleSheets 应用，避免复制两套面板样式。
+      if (!floatingStyleSheet) {
+        floatingStyleSheet = fetch(chrome.runtime.getURL('content.css')).then(async (response) => {
+          if (!response.ok) throw new Error('Cannot load Hyliter floating styles');
+          const sheet = new CSSStyleSheet();
+          sheet.replaceSync(await response.text());
+          return sheet;
+        }).catch((error) => {
+          floatingStyleSheet = null;
+          throw error;
+        });
+      }
+      const sheet = await floatingStyleSheet;
+      if (!root.adoptedStyleSheets.includes(sheet)) root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
+    }
+    return { container, ancestors };
+  }
+
+  function showFloatingElement(el, layer, onOwnerClose) {
+    layer.container.appendChild(el);
+    const lifetime = new AbortController();
+    floatingLifetimes.set(el, lifetime);
+    layer.ancestors.forEach((owner) => {
+      owner.addEventListener('beforetoggle', (e) => {
+        if (e.target === owner && e.newState === 'closed') onOwnerClose();
+      }, { signal: lifetime.signal });
+      owner.addEventListener('close', (e) => {
+        if (e.target === owner) onOwnerClose();
+      }, { signal: lifetime.signal });
+    });
+    if (typeof el.showPopover === 'function') {
+      el.setAttribute('popover', 'manual');
+      el.showPopover(); // 后进入 Top Layer，显示在已打开的宿主弹窗之上。
+    }
+  }
+
+  function removeFloatingElement(el) {
+    floatingLifetimes.get(el)?.abort();
+    floatingLifetimes.delete(el);
+    el.remove();
+  }
+
+  async function showPanelForSelection() {
+    if (!enabled) return;
+    const request = ++panelRequest;
+    const snapshot = captureSelection();
+    if (!snapshot || !snapshot.text.trim()) return;
+    const firstRange = snapshot.ranges.find((range) => range.toString().trim());
+    if (!firstRange) return;
+    const layer = await prepareFloatingLayer(firstRange.startContainer);
+    if (request !== panelRequest || !enabled || !firstRange.startContainer.isConnected ||
+        layer.ancestors.some((owner) => !isOpenFloatingOwner(owner))) return;
+    savedSelection = snapshot;
+    mode = detectModeForRange(firstRange);
     ensurePanel();
     renderPanel();
-    positionPanel(savedRange);
+    showFloatingElement(panelEl, layer, hidePanel);
+    positionPanel(savedSelection.ranges);
     requestAnimationFrame(() => panelEl && panelEl.classList.add('twh-visible'));
   }
 
   function hidePanel() {
+    panelRequest += 1;
     clearTimeout(clearConfirmTimer);
+    savedSelection = null;
     if (panelEl) {
-      panelEl.remove();
+      removeFloatingElement(panelEl);
       panelEl = null;
     }
   }
 
   function ensurePanel() {
-    if (panelEl) panelEl.remove();
+    if (panelEl) removeFloatingElement(panelEl);
     panelEl = document.createElement('div');
     panelEl.className = 'twh-panel';
-    document.body.appendChild(panelEl);
     // 阻止在面板内点击时清空页面选区 / 触发“点击外部关闭”逻辑
     panelEl.addEventListener('mousedown', (e) => e.preventDefault());
   }
@@ -177,11 +450,9 @@
       // 背景用当前模式对应的那一版颜色，文字色用同一色相的另一版——
       // 二者本就是深浅配对，浅底配深字/深底配浅字，对比度天然有保障，
       // 不必再退回黑/白这种和色块本身脱节的通用色
-      const bg = mode === 'light' ? ds.colorLight : ds.colorDark;
-      const fg = mode === 'light' ? ds.colorDark : ds.colorLight;
-      if (savedRange) highlightRange(savedRange, bg, fg, mode);
+      if (savedSelection) highlightSelection(savedSelection, ds.colorLight, ds.colorDark);
       hidePanel();
-      window.getSelection().removeAllRanges();
+      clearSelection();
     }
   }
 
@@ -232,8 +503,16 @@
 
   /* ============ 定位：不遮挡正在高亮的文本 ============ */
 
-  function positionPanel(range) {
-    const rect = range.getBoundingClientRect();
+  function positionPanel(ranges) {
+    const rects = ranges.flatMap((range) => [...range.getClientRects()])
+      .filter((rect) => rect.width || rect.height);
+    const rect = rects.length ? {
+      left: Math.min(...rects.map((r) => r.left)),
+      right: Math.max(...rects.map((r) => r.right)),
+      top: Math.min(...rects.map((r) => r.top)),
+      bottom: Math.max(...rects.map((r) => r.bottom)),
+    } : ranges[0].getBoundingClientRect();
+    const selectionWidth = rect.right - rect.left;
 
     panelEl.style.visibility = 'hidden';
     panelEl.style.left = '0px';
@@ -250,14 +529,14 @@
     }
     if (top < 0) top = GAP;
 
-    let left = rect.left + rect.width / 2 - pw / 2;
+    let left = rect.left + selectionWidth / 2 - pw / 2;
     left = Math.max(GAP, Math.min(left, window.innerWidth - pw - GAP));
 
     panelEl.style.left = `${left}px`;
     panelEl.style.top = `${top}px`;
     panelEl.style.visibility = 'visible';
 
-    positionArrow(rect, left, placement, pw);
+    positionArrow({ left: rect.left, width: selectionWidth }, left, placement, pw);
   }
 
   function positionArrow(selectionRect, panelLeft, placement, panelWidth) {
@@ -281,9 +560,9 @@
   const COPY_ANIM_DURATION = 700; // 复制成功后，按钮动画+图标复原前的展示时长（毫秒）
 
   function copySelection() {
-    if (!savedRange) return;
+    if (!savedSelection) return;
     const btn = panelEl && panelEl.querySelector('[data-action="copy"]');
-    const text = savedRange.toString();
+    const text = savedSelection.text;
     const done = () => playCopyAnimation(btn);
 
     if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -331,32 +610,6 @@
 
   /* ============ 高亮标记的添加 ============ */
 
-  function collectTextNodes(range) {
-    const root = range.commonAncestorContainer;
-
-    // 选区完全落在单个文本节点内时，TreeWalker 无法从该节点本身出发遍历，需特殊处理
-    if (root.nodeType === Node.TEXT_NODE) return [root];
-
-    const nodes = [];
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-      acceptNode(node) {
-        if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_SKIP;
-        if (node.parentElement && node.parentElement.closest('.twh-panel, script, style, textarea, input')) {
-          return NodeFilter.FILTER_REJECT;
-        }
-        try {
-          return range.intersectsNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
-        } catch (e) {
-          return NodeFilter.FILTER_SKIP;
-        }
-      },
-    });
-
-    let n;
-    while ((n = walker.nextNode())) nodes.push(n);
-    return nodes;
-  }
-
   let groupSeq = 0;
   function makeGroupId() {
     // 同一次高亮操作（哪怕跨越多个文本节点/多层元素、被拆成好几个 span）
@@ -367,27 +620,34 @@
 
   let highlightHistory = []; // 按创建顺序记录当前页面上仍存在的高亮分组 id，供 Ctrl/Cmd+Z 撤销使用
 
-  function highlightRange(range, bgColor, fgColor, usedMode) {
-    const nodes = collectTextNodes(range);
+  function highlightSelection(snapshot, lightColor, darkColor) {
     const groupId = makeGroupId();
-    let wrapped = false;
+    // 先冻结边界再从后向前修改，splitText 不会破坏后续片段的偏移。
+    const parts = snapshot.ranges.map((range) => ({
+      node: range.startContainer, start: range.startOffset, end: range.endOffset,
+      mode: detectModeForRange(range),
+    }));
+    parts.reverse().forEach(({ node, start, end, mode: usedMode }) => {
+      if (!node.isConnected || node.nodeType !== Node.TEXT_NODE || start >= end || end > node.length ||
+          !node.nodeValue.slice(start, end).trim()) return;
+      const bgColor = usedMode === 'light' ? lightColor : darkColor;
+      const fgColor = usedMode === 'light' ? darkColor : lightColor;
 
-    nodes.forEach((node) => {
-      const isStart = node === range.startContainer;
-      const isEnd = node === range.endContainer;
-      const start = isStart ? range.startOffset : 0;
-      const end = isEnd ? range.endOffset : node.nodeValue.length;
-      if (start >= end) return;
-
+      const manualSlot = manualSlotFor(node);
+      const assigned = manualSlot && manualSlot.assignedNodes();
       let target = node;
-      if (end < target.nodeValue.length) target.splitText(end);
+      const tail = end < target.nodeValue.length ? target.splitText(end) : null;
       if (start > 0) target = target.splitText(start);
 
-      wrapWithHighlight(target, bgColor, fgColor, groupId, usedMode);
-      wrapped = true;
+      const span = wrapWithHighlight(target, bgColor, fgColor, groupId, usedMode);
+      if (manualSlot) {
+        const replacements = [...(start > 0 ? [node] : []), span, ...(tail ? [tail] : [])];
+        manualSlot.assign(...assigned.flatMap((item) => item === node ? replacements : [item]));
+        replacements.forEach((item) => assignedSlots.set(item, manualSlot));
+      }
     });
 
-    if (wrapped) highlightHistory.push(groupId);
+    if (highlightGroups.has(groupId)) highlightHistory.push(groupId);
   }
 
   function wrapWithHighlight(textNode, bgColor, fgColor, groupId, usedMode) {
@@ -397,23 +657,58 @@
     // 文字色固定用配色对里的另一版，不再依赖页面原本的文字颜色——
     // 选区里混了链接、代码等自带颜色的元素时，也不会因为撞色导致看不清
     span.style.color = fgColor;
+    // document 的样式表不能穿过 Shadow DOM，必要的标记样式直接作用于节点。
+    span.style.borderRadius = '2px';
+    span.style.boxDecorationBreak = 'clone';
+    span.style.webkitBoxDecorationBreak = 'clone';
+    span.style.cursor = 'pointer';
     span.dataset.twhGroup = groupId;
     // 记录这条高亮是在浅色还是深色模式下创建的，供之后悬浮时的"取消"按钮据此换肤，
     // 而不是跟随用户当下面板碰巧切换到的模式
     span.dataset.twhMode = usedMode === 'dark' ? 'dark' : 'light';
     textNode.parentNode.insertBefore(span, textNode);
     span.appendChild(textNode);
+    const root = span.getRootNode();
+    bindRootEvents(root);
+    if (!highlightGroups.has(groupId)) highlightGroups.set(groupId, new Map());
+    const roots = highlightGroups.get(groupId);
+    if (!roots.has(root)) roots.set(root, new Set());
+    roots.get(root).add(span);
+    return span;
   }
 
   function clearAllHighlights() {
-    document.querySelectorAll('.' + HL_CLASS).forEach((span) => {
-      const parent = span.parentNode;
-      if (!parent) return;
-      while (span.firstChild) parent.insertBefore(span.firstChild, span);
-      parent.removeChild(span);
-      parent.normalize();
+    const marks = new Set(queryAllRoots('.' + HL_CLASS));
+    highlightGroups.forEach((roots) => {
+      roots.forEach((spans) => spans.forEach((span) => marks.add(span)));
     });
+    unwrapHighlights(marks);
+    highlightGroups.clear();
     highlightHistory = [];
+    hideUnmarkButton();
+  }
+
+  function unwrapHighlights(marks) {
+    const parents = new Set();
+    marks.forEach((span) => {
+      const parent = span && span.parentNode;
+      if (!parent) return;
+      const manualSlot = manualSlotFor(span);
+      const assigned = manualSlot && manualSlot.assignedNodes();
+      const children = [...span.childNodes];
+      while (span.firstChild) parent.insertBefore(span.firstChild, span);
+      span.remove();
+      if (manualSlot) {
+        manualSlot.assign(...assigned.flatMap((item) => item === span ? children : [item]));
+        children.forEach((item) => assignedSlots.set(item, manualSlot));
+      }
+      parents.add(parent);
+    });
+    // 同级多个标记全部拆完后再 normalize，避免在循环中改变其余节点。
+    parents.forEach((parent) => {
+      // 手动 slot 分配依赖具体 Text 节点身份，normalize 可能合并未分配的相邻文本。
+      if (shadowRootOf(parent)?.slotAssignment !== 'manual') parent.normalize();
+    });
   }
 
   /* ============ 悬浮取消单条高亮 ============ */
@@ -453,7 +748,8 @@
 
   function onDocMouseOver(e) {
     if (!enabled) return;
-    const mark = e.target.closest && e.target.closest('.' + HL_CLASS);
+    const mark = eventPath(e).find((node) => node.nodeType === Node.ELEMENT_NODE &&
+      node.classList.contains(HL_CLASS));
     if (!mark) return;
 
     if (!hoveredMark) {
@@ -511,10 +807,11 @@
   }
 
   function hideUnmarkButton() {
+    unmarkRequest += 1;
     clearTimeout(switchCandidateTimer);
     switchCandidateMark = null;
     if (unmarkBtn) {
-      unmarkBtn.remove();
+      removeFloatingElement(unmarkBtn);
       unmarkBtn = null;
     }
     hoveredMark = null;
@@ -526,8 +823,12 @@
     '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" ' +
     'stroke-width="2.5" stroke-linecap="round"><path d="M6 6L18 18M18 6L6 18"/></svg>';
 
-  function showUnmarkButton(mark) {
-    if (unmarkBtn) unmarkBtn.remove();
+  async function showUnmarkButton(mark) {
+    const request = ++unmarkRequest;
+    const layer = await prepareFloatingLayer(mark);
+    if (request !== unmarkRequest || !enabled || hoveredMark !== mark || !mark.isConnected ||
+        layer.ancestors.some((owner) => !isOpenFloatingOwner(owner))) return;
+    if (unmarkBtn) removeFloatingElement(unmarkBtn);
 
     // 用这条高亮自己记录的 twhMode，而不是当前全局 mode——
     // 这样悬浮在一条"深色模式下创建"的高亮上时，取消按钮也会以深色模式的皮肤出现，
@@ -543,7 +844,7 @@
       hideUnmarkButton();
     });
 
-    document.body.appendChild(unmarkBtn);
+    showFloatingElement(unmarkBtn, layer, hideUnmarkButton);
     positionUnmarkButton(mark);
   }
 
@@ -576,17 +877,17 @@
   function removeHighlightGroup(groupId, fallbackMark) {
     // 同一次高亮操作可能因跨越多个文本节点/元素而被拆分成若干个 span，
     // 这里按分组 id 一次性全部移除，而不是只移除某一小段
-    const group = groupId
-      ? document.querySelectorAll('.' + HL_CLASS + '[data-twh-group="' + CSS.escape(groupId) + '"]')
-      : [fallbackMark];
-
-    group.forEach((span) => {
-      const parent = span.parentNode;
-      if (!parent) return;
-      while (span.firstChild) parent.insertBefore(span.firstChild, span);
-      parent.removeChild(span);
-      parent.normalize();
-    });
+    const marks = new Set(fallbackMark ? [fallbackMark] : []);
+    if (groupId) {
+      const selector = '.' + HL_CLASS + '[data-twh-group="' + CSS.escape(groupId) + '"]';
+      queryAllRoots(selector).forEach((span) => marks.add(span));
+      highlightGroups.get(groupId)?.forEach((spans, root) => {
+        root.querySelectorAll(selector).forEach((span) => marks.add(span));
+        spans.forEach((span) => marks.add(span));
+      });
+      highlightGroups.delete(groupId);
+    }
+    unwrapHighlights(marks);
   }
 
   function removeFromHistory(groupId) {
@@ -620,7 +921,7 @@
     // 全局撤销上一次高亮：Ctrl/Cmd+Z。不要求面板处于打开状态。
     // 只有在“确实存在可撤销的高亮”时才拦截按键，避免影响网页本身的撤销功能
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'z' || e.key === 'Z')) {
-      if (isEditableTarget(e.target)) return;
+      if (eventPath(e).some(isEditableTarget)) return;
       if (highlightHistory.length === 0) return;
       e.preventDefault();
       undoLastHighlight();
@@ -630,20 +931,19 @@
     if (!panelEl) return; // 以下快捷键仅在面板打开时生效
 
     if (e.key === 'Escape') {
+      e.preventDefault(); // 先关闭插件面板，避免同时触发宿主 auto popover 的原生关闭。
       hidePanel();
-      window.getSelection().removeAllRanges();
+      clearSelection();
       return;
     }
 
     if (!e.ctrlKey && !e.metaKey && !e.altKey && e.key >= '1' && e.key <= '7') {
       const idx = Number(e.key) - 1;
-      const bg = mode === 'light' ? LIGHT_COLORS[idx] : DARK_COLORS[idx];
-      const fg = mode === 'light' ? DARK_COLORS[idx] : LIGHT_COLORS[idx];
-      if (bg && savedRange) {
+      if (savedSelection && !eventPath(e).some(isEditableTarget)) {
         e.preventDefault();
-        highlightRange(savedRange, bg, fg, mode);
+        highlightSelection(savedSelection, LIGHT_COLORS[idx], DARK_COLORS[idx]);
         hidePanel();
-        window.getSelection().removeAllRanges();
+        clearSelection();
       }
     }
   }
@@ -653,25 +953,47 @@
   // 高亮标记本身依然只存在于当前 DOM 中，不做任何持久化，
   // 关闭或刷新页面后高亮自然消失。
 
-  document.addEventListener('mouseover', onDocMouseOver);
+  function bindRootEvents(root) {
+    if (boundRoots.has(root)) return;
+    boundRoots.add(root);
+    const oncePerEvent = (handler) => (e) => {
+      if (handledEvents.has(e)) return;
+      handledEvents.add(e);
+      handler(e);
+    };
+    // closed root 的完整 composedPath 仅在 root 内可见；让最内层监听器先处理，
+    // 同一个冒泡事件到达外层 root / document 时不再重复执行。
+    root.addEventListener('mouseover', oncePerEvent(onDocMouseOver));
+    root.addEventListener('keydown', oncePerEvent(onDocKeyDown));
+    root.addEventListener('mouseup', oncePerEvent(onRootMouseUp));
+    root.addEventListener('mousedown', oncePerEvent(onRootMouseDown));
+  }
+
   document.addEventListener('mouseout', onDocMouseOut);
   document.addEventListener('mousemove', onDocMouseMove);
-  document.addEventListener('keydown', onDocKeyDown);
 
-  document.addEventListener('mouseup', (e) => {
-    if (panelEl && panelEl.contains(e.target)) return;
+  function onRootMouseUp(e) {
+    if (eventIncludes(e, panelEl) || eventIncludes(e, unmarkBtn)) return;
     if (!enabled) return;
     // 只响应鼠标左键；e.detail 为本次点击序列的连续次数：
     // 1 = 单击拖拽选中，2/3 = 双击选词、三击选段等——这些情况不弹出面板
     if (e.button !== 0 || e.detail !== 1) return;
     setTimeout(showPanelForSelection, 0);
-  });
+  }
 
-  document.addEventListener('mousedown', (e) => {
-    if (panelEl && !panelEl.contains(e.target)) {
+  function onRootMouseDown(e) {
+    if (panelEl && !eventIncludes(e, panelEl)) {
       hidePanel();
     }
-  });
+  }
+
+  // 按需发现动态创建的 root（包括已有宿主后来 attachShadow 的情况），
+  // 不劫持页面的 attachShadow，也不需要持续轮询整页。
+  document.addEventListener('mousedown', () => { if (enabled) discoverRoots(); }, true);
+  document.addEventListener('keydown', (e) => {
+    if (enabled && (panelEl || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z'))) discoverRoots();
+  }, true);
+  discoverRoots();
 
   window.addEventListener(
     'scroll',

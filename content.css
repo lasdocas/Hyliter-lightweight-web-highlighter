@@ -1,3 +1,17 @@
+/* Top Layer 中仍按视口坐标定位，清除浏览器给 popover 的居中和裁切默认值。 */
+.twh-panel,
+.twh-unmark-btn {
+  inset: auto;
+  margin: 0;
+  overflow: visible;
+}
+
+.twh-panel::backdrop,
+.twh-unmark-btn::backdrop {
+  background: transparent;
+  pointer-events: none;
+}
+
 /* ============ 选区操作面板 ============ */
 .twh-panel {
   position: fixed;
